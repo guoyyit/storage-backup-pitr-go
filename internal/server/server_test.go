@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/guoyyit/storage-backup-pitr-go/internal/backup"
@@ -116,4 +117,93 @@ func TestHTTPKVSAndBackupRestore(t *testing.T) {
 		t.Fatalf("a=%q ok=%v", v, ok)
 	}
 	r.Close()
+}
+
+func setupWithDirs(t *testing.T) (*httptest.Server, string, string, func()) {
+	t.Helper()
+	ctx := context.Background()
+	dataDir := filepath.Join(t.TempDir(), "eng")
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	eng, err := engine.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, err := backup.NewService(ctx, eng, backup.Config{Dir: repoDir, Retention: backup.Retention{Count: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{Addr: ":0"}, eng, svc)
+	ts := httptest.NewServer(srv.Handler())
+	return ts, dataDir, repoDir, func() {
+		ts.Close()
+		eng.Close()
+	}
+}
+
+// Restore into the engine data dir or repository is rejected with a
+// distinguishable 409 and a locatable message; a restore of a reclaimed chain
+// also returns 409.
+func TestHTTPRestoreSafety(t *testing.T) {
+	ctx := context.Background()
+	ts, dataDir, repoDir, cleanup := setupWithDirs(t)
+	defer cleanup()
+
+	if code := doJSON(t, http.MethodPut, ts.URL+"/v1/kv/a", map[string]string{"value": "1"}, nil); code != 200 {
+		t.Fatalf("put status=%d", code)
+	}
+	var old backup.Meta
+	if code := doJSON(t, http.MethodPost, ts.URL+"/v1/backups/full",
+		map[string]string{"chain_id": "chain-old"}, &old); code != 201 {
+		t.Fatalf("full status=%d", code)
+	}
+
+	// Collision with the engine data directory.
+	var errBody map[string]string
+	code := doJSON(t, http.MethodPost, ts.URL+"/v1/backups/restore", map[string]any{
+		"chain_id": old.ChainID, "target_csn": old.PointCSN,
+		"dest_dir": filepath.Join(dataDir, "restore"),
+	}, &errBody)
+	if code != http.StatusConflict {
+		t.Fatalf("engine-conflict status=%d want 409", code)
+	}
+	if !strings.Contains(errBody["error"], "engine_data_dir") {
+		t.Fatalf("error must name kind=engine_data_dir: %v", errBody)
+	}
+
+	// Collision with the backup repository via a relative "./" form.
+	code = doJSON(t, http.MethodPost, ts.URL+"/v1/backups/restore", map[string]any{
+		"chain_id": old.ChainID, "target_csn": old.PointCSN,
+		"dest_dir": filepath.Join(repoDir, "chain-old", "."),
+	}, &errBody)
+	if code != http.StatusConflict {
+		t.Fatalf("repo-conflict status=%d want 409", code)
+	}
+	if !strings.Contains(errBody["error"], "backup_repository") {
+		t.Fatalf("error must name kind=backup_repository: %v", errBody)
+	}
+
+	// Push chain-old out of retention, then restoring it must yield 409.
+	if code := doJSON(t, http.MethodPut, ts.URL+"/v1/kv/b", map[string]string{"value": "2"}, nil); code != 200 {
+		t.Fatalf("put status=%d", code)
+	}
+	if code := doJSON(t, http.MethodPost, ts.URL+"/v1/backups/full",
+		map[string]string{"chain_id": "chain-new"}, nil); code != 201 {
+		t.Fatalf("full-new status=%d", code)
+	}
+	code = doJSON(t, http.MethodPost, ts.URL+"/v1/backups/restore", map[string]any{
+		"chain_id": old.ChainID, "target_csn": old.PointCSN,
+		"dest_dir": filepath.Join(t.TempDir(), "r"),
+	}, &errBody)
+	if code != http.StatusConflict {
+		t.Fatalf("reclaimed-chain status=%d want 409, body=%v", code, errBody)
+	}
+	if !strings.Contains(errBody["error"], "chain unavailable") {
+		t.Fatalf("error must identify an unavailable chain: %v", errBody)
+	}
+
+	// The engine still serves traffic after the rejections.
+	if code := doJSON(t, http.MethodPut, ts.URL+"/v1/kv/c", map[string]string{"value": "3"}, nil); code != 200 {
+		t.Fatalf("post-rejection put status=%d", code)
+	}
+	_ = ctx
 }

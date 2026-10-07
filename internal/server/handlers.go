@@ -179,7 +179,14 @@ func (s *Server) handleApplyRetention(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeBackupError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, backup.ErrCorruptBackup) {
+	switch {
+	case errors.Is(err, backup.ErrRestoreTargetConflict):
+		// The destination collides with the engine data dir or repository.
+		status = http.StatusConflict
+	case errors.Is(err, backup.ErrChainUnavailable):
+		// The selected chain was reclaimed before the restore could start.
+		status = http.StatusConflict
+	case errors.Is(err, backup.ErrCorruptBackup):
 		status = http.StatusUnprocessableEntity
 	}
 	writeErr(w, status, err.Error())

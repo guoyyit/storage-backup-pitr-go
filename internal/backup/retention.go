@@ -39,10 +39,26 @@ func (s *Service) applyRetentionLocked(ctx context.Context) error {
 	}
 
 	for _, c := range dropped {
-		if err := os.RemoveAll(chainPath(s.cfg.Dir, c.ID)); err != nil {
-			return err
+		// A restore that started using this chain pinned it. Wait for the
+		// restore to finish before deleting so an in-flight restore never
+		// observes a partially reclaimed chain. Conversely, a restore that
+		// has not pinned the chain by the time it is dropped fails with
+		// ErrChainUnavailable before writing anything. Either outcome is
+		// deterministic and free of partial writes.
+		for s.chainPinnedLocked(c.ID) {
+			s.restoreCond.Wait()
 		}
-		if err := syncDir(s.cfg.Dir); err != nil {
+		// Delete under the chain lock: the restore re-checks chain existence
+		// after taking this same lock, so it can never read a half-deleted
+		// chain directory.
+		mu := chainLock(c.ID)
+		mu.Lock()
+		err := os.RemoveAll(chainPath(s.cfg.Dir, c.ID))
+		if err == nil {
+			err = syncDir(s.cfg.Dir)
+		}
+		mu.Unlock()
+		if err != nil {
 			return err
 		}
 	}

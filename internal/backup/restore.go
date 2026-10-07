@@ -25,6 +25,13 @@ func (s *Service) RestoreTo(ctx context.Context, opts RestoreOptions) (*Meta, er
 		return nil, fmt.Errorf("backup: restore target (CSN or time) required")
 	}
 
+	// Isolate the destination from the running engine and the repository
+	// before anything is created, removed or renamed. Relative paths,
+	// duplicate separators and symlinks are all resolved to their real target.
+	if err := validateRestoreTarget(opts.DestDir, s.eng.Dir(), s.cfg.Dir); err != nil {
+		return nil, err
+	}
+
 	chainID := opts.ChainID
 	if chainID == "" {
 		s.mu.Lock()
@@ -35,8 +42,27 @@ func (s *Service) RestoreTo(ctx context.Context, opts RestoreOptions) (*Meta, er
 		}
 		chainID = id
 	}
+
+	// Pin the chain while we restore it: retention blocks until this pin is
+	// released, and a chain reclaimed before we pin makes us fail here, before
+	// the destination (or its staging directory) is touched.
+	if err := s.pinChain(chainID); err != nil {
+		return nil, err
+	}
+	defer s.unpinChain(chainID)
+
 	chainLock(chainID).Lock()
 	defer chainLock(chainID).Unlock()
+
+	// Re-check existence under the chain lock. Retention deletes chains while
+	// holding this lock, so this either observes the chain still present or a
+	// definitive ErrChainUnavailable, never a half-deleted directory.
+	if _, err := os.Stat(chainPath(s.cfg.Dir, chainID)); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: chain %s was reclaimed before restore started", ErrChainUnavailable, chainID)
+		}
+		return nil, err
+	}
 
 	chain, err := loadChain(s.cfg.Dir, chainID)
 	if err != nil {

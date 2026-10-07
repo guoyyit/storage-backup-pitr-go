@@ -4,6 +4,7 @@ package backup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -35,6 +36,8 @@ type Engine interface {
 	ReclaimThrough(ctx context.Context, idx uint64) error
 	CheckpointAt(ctx context.Context, csn uint64) (string, error)
 	WALDir() string
+	// Dir returns the engine data directory (restore target isolation root).
+	Dir() string
 	// MinLiveSegmentIndex returns the index of the oldest retained segment.
 	MinLiveSegmentIndex() uint64
 	// SnapshotPath returns the current snapshot file, or "" if none.
@@ -125,7 +128,14 @@ type Service struct {
 	// Global mutex serializes backup/retention bookkeeping so concurrent
 	// operations produce deterministic, non-overlapping chains. Heavy file
 	// copies for a chain happen under that chain's lock.
-	mu sync.Mutex
+	//
+	// restorePins tracks chains currently being restored. Retention waits for
+	// a pin to clear before deleting that chain, and a restore refuses a chain
+	// that no longer exists when it acquires its pin. The map is guarded by
+	// mu; restoreCond wakes retention when pins are released.
+	mu          sync.Mutex
+	restoreCond *sync.Cond
+	restorePins map[string]int
 }
 
 // NewService creates a backup service rooted at cfg.Dir.
@@ -136,5 +146,45 @@ func NewService(_ context.Context, eng Engine, cfg Config) (*Service, error) {
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &Service{eng: eng, cfg: cfg}, nil
+	s := &Service{
+		eng:         eng,
+		cfg:         cfg,
+		restorePins: make(map[string]int),
+	}
+	s.restoreCond = sync.NewCond(&s.mu)
+	return s, nil
+}
+
+// pinChain marks chainID as in use by a restore. Callers must hold no locks.
+// It returns ErrChainUnavailable if the chain directory does not exist on
+// disk: such a chain was never created or was reclaimed before this restore
+// started, and no destination write may happen.
+func (s *Service) pinChain(chainID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := os.Stat(chainPath(s.cfg.Dir, chainID)); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: chain %s was reclaimed or does not exist", ErrChainUnavailable, chainID)
+		}
+		return err
+	}
+	s.restorePins[chainID]++
+	return nil
+}
+
+// unpinChain releases one restore pin and wakes retention waiting on it.
+func (s *Service) unpinChain(chainID string) {
+	s.mu.Lock()
+	if n := s.restorePins[chainID]; n > 1 {
+		s.restorePins[chainID] = n - 1
+	} else {
+		delete(s.restorePins, chainID)
+	}
+	s.restoreCond.Broadcast()
+	s.mu.Unlock()
+}
+
+// chainPinnedLocked reports whether chainID is currently being restored.
+func (s *Service) chainPinnedLocked(chainID string) bool {
+	return s.restorePins[chainID] > 0
 }
