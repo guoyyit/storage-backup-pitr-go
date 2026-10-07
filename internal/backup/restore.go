@@ -21,6 +21,16 @@ func (s *Service) RestoreTo(ctx context.Context, opts RestoreOptions) (*Meta, er
 	if opts.DestDir == "" {
 		return nil, fmt.Errorf("backup: restore destination dir required")
 	}
+	// Safety gate: the destination must be isolated from the running engine's
+	// data directory and the backup repository. This runs before any write so
+	// a rejected target leaves the engine, the repository and the destination
+	// path completely untouched.
+	if err := checkRestoreDest(opts.DestDir,
+		protectedDir{kind: ProtectedEngineDir, dir: engineDataDir(s.eng)},
+		protectedDir{kind: ProtectedBackupRepo, dir: s.cfg.Dir},
+	); err != nil {
+		return nil, err
+	}
 	if opts.TargetCSN == 0 && opts.TargetTime.IsZero() {
 		return nil, fmt.Errorf("backup: restore target (CSN or time) required")
 	}

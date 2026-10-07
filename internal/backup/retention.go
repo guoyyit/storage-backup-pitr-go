@@ -39,7 +39,16 @@ func (s *Service) applyRetentionLocked(ctx context.Context) error {
 	}
 
 	for _, c := range dropped {
-		if err := os.RemoveAll(chainPath(s.cfg.Dir, c.ID)); err != nil {
+		// Take the chain lock before deleting so a restore that already
+		// started on this chain finishes first; a restore that arrives
+		// afterwards observes the chain as cleanly absent (ErrChainNotFound)
+		// instead of reading a half-deleted chain. Lock ordering matches
+		// FullBackup/IncrementalBackup (s.mu -> chain lock), so no cycle.
+		mu := chainLock(c.ID)
+		mu.Lock()
+		err := os.RemoveAll(chainPath(s.cfg.Dir, c.ID))
+		mu.Unlock()
+		if err != nil {
 			return err
 		}
 		if err := syncDir(s.cfg.Dir); err != nil {

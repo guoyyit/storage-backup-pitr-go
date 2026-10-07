@@ -12,6 +12,9 @@ import (
 func loadChain(root, chainID string) (Chain, error) {
 	metas, err := listChain(root, chainID)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return Chain{}, fmt.Errorf("%w: %s", ErrChainNotFound, chainID)
+		}
 		return Chain{}, err
 	}
 	if len(metas) == 0 {
@@ -77,7 +80,7 @@ func (s *Service) newestChainIDLocked() (string, error) {
 		return "", err
 	}
 	if len(chains) == 0 {
-		return "", fmt.Errorf("backup: no chains exist")
+		return "", fmt.Errorf("%w: no chains exist", ErrChainNotFound)
 	}
 	return chains[0].ID, nil
 }

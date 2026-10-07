@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/guoyyit/storage-backup-pitr-go/internal/backup"
@@ -116,4 +117,74 @@ func TestHTTPKVSAndBackupRestore(t *testing.T) {
 		t.Fatalf("a=%q ok=%v", v, ok)
 	}
 	r.Close()
+}
+
+// Restore-target conflicts and missing chains surface as distinguishable
+// HTTP statuses: 400 for a protected destination, 404 for a reclaimed chain.
+func TestHTTPRestoreTargetRejection(t *testing.T) {
+	ctx := context.Background()
+	dataDir := filepath.Join(t.TempDir(), "eng")
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	eng, err := engine.Open(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	svc, err := backup.NewService(ctx, eng, backup.Config{Dir: repoDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{Addr: ":0"}, eng, svc)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	if code := doJSON(t, http.MethodPut, ts.URL+"/v1/kv/a", map[string]string{"value": "1"}, nil); code != 200 {
+		t.Fatalf("put status=%d", code)
+	}
+	var full backup.Meta
+	if code := doJSON(t, http.MethodPost, ts.URL+"/v1/backups/full", map[string]string{}, &full); code != 201 {
+		t.Fatalf("full status=%d", code)
+	}
+
+	var errBody map[string]string
+	// Engine data directory itself and inside it: 400 naming the conflict.
+	for _, dest := range []string{dataDir, filepath.Join(dataDir, "wal")} {
+		code := doJSON(t, http.MethodPost, ts.URL+"/v1/backups/restore", map[string]any{
+			"chain_id": full.ChainID, "target_csn": full.PointCSN, "dest_dir": dest,
+		}, &errBody)
+		if code != http.StatusBadRequest {
+			t.Fatalf("restore to %q status=%d want 400 (%v)", dest, code, errBody)
+		}
+		if !strings.Contains(errBody["error"], "engine-data-dir") {
+			t.Fatalf("error %q does not name engine-data-dir", errBody["error"])
+		}
+	}
+	// Inside the backup repository: 400 naming the repository.
+	code := doJSON(t, http.MethodPost, ts.URL+"/v1/backups/restore", map[string]any{
+		"chain_id": full.ChainID, "target_csn": full.PointCSN,
+		"dest_dir": filepath.Join(repoDir, "sub"),
+	}, &errBody)
+	if code != http.StatusBadRequest || !strings.Contains(errBody["error"], "backup-repository") {
+		t.Fatalf("repo restore status=%d err=%v", code, errBody)
+	}
+	// A chain that does not exist: 404.
+	code = doJSON(t, http.MethodPost, ts.URL+"/v1/backups/restore", map[string]any{
+		"chain_id": "chain-missing", "target_csn": 1,
+		"dest_dir": filepath.Join(t.TempDir(), "out"),
+	}, &errBody)
+	if code != http.StatusNotFound {
+		t.Fatalf("missing chain status=%d want 404", code)
+	}
+	// A legitimate independent destination still works: 201.
+	code = doJSON(t, http.MethodPost, ts.URL+"/v1/backups/restore", map[string]any{
+		"chain_id": full.ChainID, "target_csn": full.PointCSN,
+		"dest_dir": filepath.Join(t.TempDir(), "ok"),
+	}, &full)
+	if code != http.StatusCreated {
+		t.Fatalf("legit restore status=%d want 201", code)
+	}
+	// Engine is untouched and still serves writes.
+	if code := doJSON(t, http.MethodPut, ts.URL+"/v1/kv/b", map[string]string{"value": "2"}, nil); code != 200 {
+		t.Fatalf("put after rejections status=%d", code)
+	}
 }

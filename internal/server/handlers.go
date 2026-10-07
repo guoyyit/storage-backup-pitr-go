@@ -179,8 +179,13 @@ func (s *Server) handleApplyRetention(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeBackupError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, backup.ErrCorruptBackup) {
+	switch {
+	case errors.Is(err, backup.ErrCorruptBackup):
 		status = http.StatusUnprocessableEntity
+	case errors.Is(err, backup.ErrRestoreTargetConflict):
+		status = http.StatusBadRequest
+	case errors.Is(err, backup.ErrChainNotFound):
+		status = http.StatusNotFound
 	}
 	writeErr(w, status, err.Error())
 }

@@ -25,6 +25,10 @@ const (
 // ErrCorruptBackup identifies manifest/segment verification failures.
 var ErrCorruptBackup = errors.New("backup: corrupt")
 
+// ErrChainNotFound identifies a restore/backup request naming a chain that
+// does not exist (for example already reclaimed by retention).
+var ErrChainNotFound = errors.New("backup: chain not found")
+
 func backupDir(root, chainID, backupID string) string {
 	return filepath.Join(root, chainID, backupID)
 }
